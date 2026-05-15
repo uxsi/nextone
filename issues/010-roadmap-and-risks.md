@@ -19,6 +19,7 @@
 - `next-edit-server` CLI（Python，启动方式 `next-edit-server --stdio`）
 - VS Code Extension（TypeScript）
 - 基于 MLX / llama.cpp 的本地推理
+- 简易指标采集日志（trigger/accept/reject 计数）
 
 ### Phase 2：多编辑器 + 编辑历史建模（2-4 周）
 
@@ -38,9 +39,11 @@
 - 终端快捷键配置指南（iTerm2 / kitty / Alacritty / WezTerm）
 - git history → 训练数据提取工具
 
-### Phase 3：模型训练 + 延迟优化（4-8 周）
+### Phase 3：模型训练 + 延迟优化（8-16 周，含研究探索）
 
 **目标**：训练专用模型，达到生产级质量和延迟。
+
+**注意**：Phase 3 本质上是一个独立的研究项目，而非 Phase 2 的自然延伸。训练数据构建、模型训练、效果验证的周期高度不确定，8-16 周是包含探索时间的估计区间。是否启动 Phase 3 取决于 Phase 1/2 的在线指标是否达标。
 
 | 模块 | 方案 |
 |------|------|
@@ -57,6 +60,26 @@
 - fine-tuned Generation Model
 - Zed Extension
 - benchmark 评估套件
+
+## MVP 成功指标
+
+Phase 1 必须采集以下在线指标，作为判断 MVP 是否成功、是否继续投入 Phase 2 的依据。
+
+| 指标 | 定义 | 达标阈值 |
+|------|------|---------|
+| Suggestion Trigger Rate | 每小时触发建议的次数 | 作为基线记录，无硬性阈值 |
+| Acceptance Rate | 触发后被用户接受的比例 | > 25% |
+| Stale Rate | 建议生成时已过期或渲染时已失效的比例 | < 20% |
+| Annoyance Rate | 连续 3 次及以上拒绝的比例 | < 15% |
+| Latency p50 / p95 | 从最后一次编辑到建议可见的延迟 | p50 < 2.5s，p95 < 4s |
+
+指标采集方式：服务端在每次 suggest/resolve 时写入结构化日志（JSON Lines），包含 timestamp、suggestion_id、event_type（trigger/accept/reject/stale/cancel）、latency_ms。Phase 1 不做可视化，通过脚本分析日志即可。
+
+**决策规则**：
+
+- Acceptance Rate > 25% 且 Annoyance Rate < 15%：Phase 2 值得投入
+- Acceptance Rate 15-25%：需要分析拒绝原因，定向优化后再评估
+- Acceptance Rate < 15%：交互模式本身可能不成立，暂停扩展
 
 ## 风险评估
 

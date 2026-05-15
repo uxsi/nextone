@@ -1,0 +1,26 @@
+[project]
+name = "next-edit-server"
+version = "0.1.0"
+description = "Local next edit prediction server"
+requires-python = ">=3.10"
+dependencies = [
+    "tree-sitter>=0.23,<1.0",
+    "tree-sitter-languages>=1.10,<2.0",
+    "llama-cpp-python>=0.3,<1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
+[project.scripts]
+next-edit-server = "next_edit_server.__main__:main"
+
+[build-system]
+requires = ["setuptools>=75.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

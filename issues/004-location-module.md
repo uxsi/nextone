@@ -6,11 +6,15 @@
 
 ## Phase 1：tree-sitter AST 规则引擎
 
-不训练任何模型，用 AST 分析覆盖最高频的 next edit 场景。预计覆盖日常开发中 60-70% 的 next edit 场景，延迟在 10ms 级别。
+不训练任何模型，用 AST 分析覆盖最高频的 next edit 场景。覆盖率取决于项目代码风格和语言特性，需通过 Phase 1 实测验证。延迟在 10ms 级别。
+
+**能力边界**：tree-sitter 是语法解析器，提供 CST/AST，不做符号解析、作用域分析、类型推断。以下规则仅覆盖语法层面可判定的场景，遇到作用域遮蔽、别名导入、动态引用、方法重载等语义层面的情况会产生误判或遗漏。
 
 ### 场景 1：符号重命名传播
 
 用户把 `function hello()` 改名为 `goodbye()`，tree-sitter 扫描 AST，找到所有引用 `hello` 的 `call_expression` 节点，按文件顺序返回下一个需要修改的位置。
+
+**局限性**：仅覆盖同文件内的简单引用。不处理作用域遮蔽（内层作用域定义了同名变量）、别名导入（`import { hello as h }`）、动态引用（`obj[funcName]()`）。
 
 ```python
 import tree_sitter_languages as tsl
@@ -34,13 +38,17 @@ def find_rename_propagation(
 
 用户在 struct 中添加了一个字段 `session_id`，然后在 `new()` 方法中初始化了它。检测到"添加字段 → 初始化字段"的模式后，扫描其他方法（`serialize`、`validate`），预测它们也需要处理 `session_id`。
 
-### 场景 3：import 补全
+### 场景 3：import 补全（Phase 2 目标）
 
 用户在代码中引用了一个新符号，检测到未解析的引用，预测文件头部需要添加 import 语句。
 
+**Phase 1 不实现此场景**。import 补全本质依赖符号解析和项目索引——需要知道哪些符号在项目中可用、从哪个模块导出，单靠 tree-sitter 的语法树无法可靠完成。Phase 2 引入项目索引或复用 language server 结果后再实现。
+
 ### 场景 4：接口变更传播
 
-修改了函数签名（添加/删除参数），tree-sitter 查找所有调用点，按依赖顺序返回需要修改的位置。
+修改了函数签名（添加/删除参数），tree-sitter 查找同文件内的所有调用点，按文件顺序返回需要修改的位置。
+
+**局限性**：Phase 1 限定在当前文件内。跨文件的调用点查找依赖项目级索引，属于 Phase 2 范围。
 
 ## Phase 2：fine-tuned retriever 模型
 
@@ -62,5 +70,5 @@ NES 论文实验表明历史窗口长度为 3 时效果最佳（72.6% -do 平均
 ## 跨文件定位
 
 - Phase 1：限定在当前文件内
-- Phase 2：用 tree-sitter 符号引用分析做跨文件跳转（查找定义 → 查找所有引用）
-- Phase 3：full codebase retriever，支持 monorepo 级别的跨文件预测
+- Phase 2：语言服务结果 / 项目索引辅助的有限符号传播（复用现有 language server 的符号引用结果，而非自建索引）
+- Phase 3：学习型 retriever 作为补充，覆盖规则和索引无法触及的模式

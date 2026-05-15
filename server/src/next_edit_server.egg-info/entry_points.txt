@@ -1,0 +1,2 @@
+[console_scripts]
+next-edit-server = next_edit_server.__main__:main

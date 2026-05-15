@@ -1,0 +1,71 @@
+{
+  "name": "nextone",
+  "displayName": "NextOne",
+  "description": "Local next edit prediction — predicts and navigates to the next code change",
+  "version": "0.1.0",
+  "publisher": "nextone",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "nextEdit.accept",
+        "title": "NextOne: Accept Suggestion"
+      },
+      {
+        "command": "nextEdit.reject",
+        "title": "NextOne: Reject Suggestion"
+      }
+    ],
+    "keybindings": [
+      {
+        "key": "cmd+;",
+        "command": "nextEdit.accept",
+        "when": "editorTextFocus && nextEdit.hasSuggestion"
+      },
+      {
+        "key": "escape",
+        "command": "nextEdit.reject",
+        "when": "editorTextFocus && nextEdit.hasSuggestion"
+      }
+    ],
+    "configuration": {
+      "title": "NextOne",
+      "properties": {
+        "nextone.serverPath": {
+          "type": "string",
+          "default": "next-edit-server",
+          "description": "Path to the next-edit-server executable"
+        },
+        "nextone.modelPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the GGUF model file. Leave empty for dummy backend."
+        },
+        "nextone.logLevel": {
+          "type": "string",
+          "enum": ["DEBUG", "INFO", "WARNING", "ERROR"],
+          "default": "INFO",
+          "description": "Server log level"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.0"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.0"
+  }
+}

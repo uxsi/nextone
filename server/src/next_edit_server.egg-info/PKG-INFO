@@ -1,0 +1,11 @@
+Metadata-Version: 2.4
+Name: next-edit-server
+Version: 0.1.0
+Summary: Local next edit prediction server
+Requires-Python: >=3.10
+Requires-Dist: tree-sitter<1.0,>=0.23
+Requires-Dist: tree-sitter-languages<2.0,>=1.10
+Requires-Dist: llama-cpp-python<1.0,>=0.3
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
+Requires-Dist: pytest-asyncio>=0.24; extra == "dev"

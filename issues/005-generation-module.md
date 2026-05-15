@@ -107,7 +107,20 @@ NES 论文数据：Qwen3-4B + SFT + DAPO 达到 27.7% Exact Match、91.36% Edit 
 | NVIDIA GPU ≥8GB | llama.cpp + CUDA | ~80 tok/s | ~120 tok/s |
 | 纯 CPU | llama.cpp CPU | ~8 tok/s | ~15 tok/s |
 
-next edit 输出通常很短（1-5 行 diff，约 50-100 tokens），Mac M-series 上可以做到 500ms 以内。
+next edit 输出通常很短（1-5 行 diff，约 50-100 tokens）。各阶段延迟估算：
+
+| 阶段 | Mac M-series（MLX, 7B） | 说明 |
+|------|------------------------|------|
+| 事件去抖 | 300-500ms | 等待用户停止输入 |
+| AST 增量解析 + 规则匹配 | 5-20ms | tree-sitter 增量解析极快 |
+| prompt 组装 | < 5ms | 字符串拼接 |
+| 首 token 延迟（TTFT） | 200-500ms | 取决于 prompt 长度和模型大小 |
+| token 生成 | 1.5-3.3s | 50-100 tokens ÷ 30 tok/s |
+| 渲染 + 旧建议清理 | < 50ms | 编辑器侧 |
+| **端到端 p50** | **约 2.5s** | |
+| **端到端 p95** | **约 4s** | |
+
+延迟可接受性取决于触发方式。用户停顿后出现的主动建议，2-3s 是可接受的等待时间（类似搜索建议的弹出延迟）。但如果在用户连续输入过程中弹出，超过 1s 就会打断编辑节奏。Phase 1 通过高置信度触发条件（仅在明确的规则匹配场景触发）回避后一种情况。
 
 ## 延迟优化（Phase 3）
 
