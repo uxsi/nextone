@@ -127,6 +127,10 @@ class Pipeline:
             end_line=end_line,
         )
         self._edit_history.record(edit)
+        logger.info(
+            "Edit recorded: uri=%s v=%d old=%r new=%r start=%d",
+            uri, version, old_lines, new_lines, start_line,
+        )
 
         # Cancel any existing suggestion for this document
         self._cancel_current_suggestion(CancelReason.DOCUMENT_CHANGED)
@@ -166,20 +170,29 @@ class Pipeline:
     def _run_pipeline(self, uri: str, version: int) -> None:
         """Execute the full pipeline: location → generation → suggest."""
         start_time = time.monotonic()
+        logger.info("Pipeline started: uri=%s version=%d", uri, version)
 
         # Check if the document version is still current
         if self._doc_store.is_version_stale(uri, version):
+            logger.info("Pipeline aborted: version %d is stale", version)
             self._metrics.record("stale")
             return
 
         doc = self._doc_store.get(uri)
         if doc is None:
+            logger.warning("Pipeline aborted: document %s not found", uri)
             return
 
         # Get the latest edit
         latest_edit = self._edit_history.latest(uri)
         if latest_edit is None:
+            logger.warning("Pipeline aborted: no edit history for %s", uri)
             return
+
+        logger.info(
+            "Pipeline input: language=%s edit.old=%r edit.new=%r edit.start=%d",
+            doc.language_id, latest_edit.old_lines, latest_edit.new_lines, latest_edit.start_line,
+        )
 
         # Run Location Module
         self._send(
@@ -191,9 +204,11 @@ class Pipeline:
             edit=latest_edit,
             source_code=doc.text,
             language=doc.language_id,
+            edit_history=self._edit_history.get(uri),
         )
 
         if prediction is None:
+            logger.info("Pipeline: no location prediction, skipping generation")
             self._send(
                 Methods.STATUS,
                 StatusParams(state=ServerState.READY),

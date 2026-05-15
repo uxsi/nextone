@@ -9,6 +9,8 @@
  */
 
 import * as vscode from "vscode";
+import * as cp from "child_process";
+import * as os from "os";
 import {
   LanguageClient,
   LanguageClientOptions,
@@ -76,15 +78,27 @@ const additionDecorType = vscode.window.createTextEditorDecorationType({
 
 export function activate(context: vscode.ExtensionContext): void {
   const config = vscode.workspace.getConfiguration("nextone");
-  const serverPath = config.get<string>("serverPath", "next-edit-server");
+  const configuredPath = config.get<string>("serverPath", "next-edit-server");
   const modelPath = config.get<string>("modelPath", "");
   const logLevel = config.get<string>("logLevel", "INFO");
 
-  // Build server args
-  const serverArgs = ["--stdio", "--log-level", logLevel];
+  // Resolve the server executable path.
+  // VS Code GUI processes don't inherit shell profile (pyenv, nvm, etc.),
+  // so a bare command name like "next-edit-server" may not be in PATH.
+  // We resolve it through the user's login shell.
+  const serverPath = resolveCommand(configuredPath);
+
+  const outputChannel = vscode.window.createOutputChannel("NextOne");
+  outputChannel.appendLine(`Server path: ${configuredPath} → ${serverPath}`);
+  context.subscriptions.push(outputChannel);
+
+  // Build server args — always log to file for diagnostics
+  const logFile = "/tmp/next-edit-server.log";
+  const serverArgs = ["--stdio", "--log-level", "DEBUG", "--log-file", logFile];
   if (modelPath) {
     serverArgs.push("--model-path", modelPath);
   }
+  outputChannel.appendLine(`Server log file: ${logFile}`);
 
   // 1. Start next-edit-server
   const serverOptions: ServerOptions = {
@@ -132,28 +146,9 @@ export function activate(context: vscode.ExtensionContext): void {
     updateStatusBar(params);
   });
 
-  // 4. Forward edit events
-  context.subscriptions.push(
-    vscode.workspace.onDidOpenTextDocument((doc) => {
-      if (doc.uri.scheme !== "file") {
-        return;
-      }
-      client.sendNotification("nextEdit/didOpen", {
-        uri: doc.uri.toString(),
-        languageId: doc.languageId,
-        version: doc.version,
-        text: doc.getText(),
-      });
-    }),
-  );
-
+  // 4. Auto-dismiss stale suggestions on document change
   context.subscriptions.push(
     vscode.workspace.onDidChangeTextDocument((event) => {
-      if (event.document.uri.scheme !== "file") {
-        return;
-      }
-
-      // Auto-dismiss stale suggestion when document changes
       if (
         currentSuggestion &&
         currentSuggestion.baseUri === event.document.uri.toString() &&
@@ -161,44 +156,6 @@ export function activate(context: vscode.ExtensionContext): void {
       ) {
         clearSuggestion();
       }
-
-      const changes = event.contentChanges.map((c) => ({
-        range: {
-          start: { line: c.range.start.line, character: c.range.start.character },
-          end: { line: c.range.end.line, character: c.range.end.character },
-        },
-        text: c.text,
-      }));
-
-      client.sendNotification("nextEdit/didChange", {
-        uri: event.document.uri.toString(),
-        version: event.document.version,
-        changes,
-        timestamp: Date.now(),
-      });
-    }),
-  );
-
-  context.subscriptions.push(
-    vscode.workspace.onDidSaveTextDocument((doc) => {
-      if (doc.uri.scheme !== "file") {
-        return;
-      }
-      client.sendNotification("nextEdit/didSave", {
-        uri: doc.uri.toString(),
-        version: doc.version,
-      });
-    }),
-  );
-
-  context.subscriptions.push(
-    vscode.workspace.onDidCloseTextDocument((doc) => {
-      if (doc.uri.scheme !== "file") {
-        return;
-      }
-      client.sendNotification("nextEdit/didClose", {
-        uri: doc.uri.toString(),
-      });
     }),
   );
 
@@ -213,19 +170,10 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   // 6. Start client
+  // LanguageClient automatically sends textDocument/didOpen, didChange,
+  // didSave, didClose for files matching documentSelector. The server
+  // translates these standard LSP messages to our custom format.
   client.start();
-
-  // 7. Send didOpen for already-open documents
-  for (const doc of vscode.workspace.textDocuments) {
-    if (doc.uri.scheme === "file") {
-      client.sendNotification("nextEdit/didOpen", {
-        uri: doc.uri.toString(),
-        languageId: doc.languageId,
-        version: doc.version,
-        text: doc.getText(),
-      });
-    }
-  }
 }
 
 export function deactivate(): Thenable<void> | undefined {
@@ -321,29 +269,27 @@ function acceptSuggestion(): void {
 
   const suggestion = currentSuggestion;
 
-  // Apply the diff: delete old lines, insert new lines
+  // Apply the diff: replace each deleted line with its corresponding added line.
+  // Phase 1 scenarios (rename, signature) produce 1:1 deleted→added mappings
+  // with matching line numbers.
   editor
     .edit((editBuilder) => {
-      // Delete the old lines
-      for (const dl of suggestion.deletedLines) {
-        const lineIdx = dl.num - 1;
-        if (lineIdx >= 0 && lineIdx < editor.document.lineCount) {
-          const line = editor.document.lineAt(lineIdx);
-          editBuilder.replace(line.range, dl.text); // Temporarily replace with same text
-        }
-      }
-
-      // Replace deleted lines with added lines
-      // Simple approach: for each deleted line, replace with the corresponding added line
+      // Build a map: line number → new text
+      const replacements = new Map<number, string>();
       for (let i = 0; i < suggestion.deletedLines.length; i++) {
         const dl = suggestion.deletedLines[i];
         const al = suggestion.addedLines[i];
         if (al) {
-          const lineIdx = dl.num - 1;
-          if (lineIdx >= 0 && lineIdx < editor.document.lineCount) {
-            const line = editor.document.lineAt(lineIdx);
-            editBuilder.replace(line.range, al.text);
-          }
+          replacements.set(dl.num, al.text);
+        }
+      }
+
+      // Apply each replacement exactly once per line
+      for (const [lineNum, newText] of replacements) {
+        const lineIdx = lineNum - 1;
+        if (lineIdx >= 0 && lineIdx < editor.document.lineCount) {
+          const line = editor.document.lineAt(lineIdx);
+          editBuilder.replace(line.range, newText);
         }
       }
     })
@@ -392,4 +338,45 @@ function updateStatusBar(params: StatusParams): void {
       statusBarItem.text = `$(error) NextOne: ${params.message}`;
       break;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Shell path resolution
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve a command name to its absolute path through the user's login shell.
+ *
+ * VS Code GUI processes on macOS don't inherit the terminal's shell profile,
+ * so tools installed via pyenv, nvm, pipx, etc. are not in PATH. This function
+ * spawns the user's login shell to run `which <command>` and returns the
+ * resolved absolute path. If resolution fails, returns the original input
+ * unchanged (the LanguageClient will attempt to find it directly).
+ */
+function resolveCommand(command: string): string {
+  // Already an absolute path — no resolution needed
+  if (command.startsWith("/")) {
+    return command;
+  }
+
+  const shell = os.userInfo().shell || "/bin/zsh";
+
+  try {
+    // -l: login shell (sources profile), -c: execute command
+    const resolved = cp
+      .execSync(`${shell} -l -c "which ${command}"`, {
+        encoding: "utf-8",
+        timeout: 5000,
+        stdio: ["pipe", "pipe", "pipe"],
+      })
+      .trim();
+
+    if (resolved && resolved.startsWith("/")) {
+      return resolved;
+    }
+  } catch {
+    // which failed — command not found in shell environment
+  }
+
+  return command;
 }

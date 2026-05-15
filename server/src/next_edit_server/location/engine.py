@@ -47,6 +47,7 @@ class LocationEngine:
         edit: EditRecord,
         source_code: str,
         language: str,
+        edit_history: list[EditRecord] | None = None,
     ) -> LocationPrediction | None:
         """Run all rules and return the highest-confidence prediction above threshold.
 
@@ -54,16 +55,31 @@ class LocationEngine:
             edit: The most recent edit event.
             source_code: Current full file content (after the edit).
             language: Language identifier.
+            edit_history: Full edit history window (oldest first). Used to detect
+                          renames that span multiple keystrokes (delete old name +
+                          type new name character by character).
 
         Returns:
             The best prediction, or None if no rule fires above threshold.
         """
         predictions: list[LocationPrediction] = []
 
-        # Rule 1: Rename propagation
+        # Rule 1: Rename propagation (single-edit detection)
         rename_pred = self._try_rename(edit, source_code, language)
         if rename_pred:
             predictions.append(rename_pred)
+
+        # Rule 1b: Rename propagation (multi-edit history detection)
+        # Real users often delete the old name then type the new name character
+        # by character, producing multiple didChange events. We compare the
+        # first edit's old_lines against the current document state to detect
+        # renames that span the entire history window.
+        if not rename_pred and edit_history and len(edit_history) >= 2:
+            composite_pred = self._try_rename_from_history(
+                edit_history, source_code, language
+            )
+            if composite_pred:
+                predictions.append(composite_pred)
 
         # Rule 2: Signature change propagation
         sig_pred = self._try_signature(edit, source_code, language)
@@ -189,4 +205,69 @@ class LocationEngine:
                 "remaining_methods": len(methods),
             },
             text=method.text,
+        )
+
+    def _try_rename_from_history(
+        self,
+        edit_history: list[EditRecord],
+        source_code: str,
+        language: str,
+    ) -> LocationPrediction | None:
+        """Detect renames that span multiple edits in the history window.
+
+        Real editing pattern: user selects "hello", deletes it (text=''),
+        then types "good" one character at a time. This produces N+1 edits:
+          edit 1: old=["def hello(name):"] new=["def (name):"]    (delete)
+          edit 2: old=["def (name):"]      new=["def g(name):"]   (type 'g')
+          edit 3: old=["def g(name):"]     new=["def go(name):"]  (type 'o')
+          ...
+
+        We compare the first edit's old_lines against the last edit's new_lines
+        to synthesize a single "composite" rename detection.
+        """
+        # All edits must be on the same line
+        first = edit_history[0]
+        last = edit_history[-1]
+        if first.start_line != last.start_line:
+            return None
+        if len(first.old_lines) != 1 or len(last.new_lines) != 1:
+            return None
+
+        # Synthesize a composite edit
+        composite = EditRecord(
+            uri=last.uri,
+            version=last.version,
+            timestamp=last.timestamp,
+            old_lines=first.old_lines,
+            new_lines=last.new_lines,
+            start_line=first.start_line,
+            end_line=first.end_line,
+        )
+
+        detection = detect_rename(composite)
+        if detection is None:
+            return None
+
+        refs = find_references(
+            source_code, language, detection.old_name, exclude_line=detection.line,
+        )
+        if not refs:
+            return None
+
+        ref = refs[0]
+        logger.info(
+            "Composite rename detected across %d edits: %s → %s",
+            len(edit_history), detection.old_name, detection.new_name,
+        )
+        return LocationPrediction(
+            line=ref.line,
+            column=ref.column,
+            rule=RuleType.RENAME,
+            confidence=0.85,  # Slightly lower than single-edit rename
+            context={
+                "old_name": detection.old_name,
+                "new_name": detection.new_name,
+                "remaining_refs": len(refs),
+            },
+            text=ref.text,
         )

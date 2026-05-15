@@ -6,30 +6,47 @@
 
 ```
 nextone/
-├── server/                         # next-edit-server（Python）
+├── server/                             # next-edit-server（Python）
 │   ├── pyproject.toml
 │   ├── scripts/
-│   │   └── verify_server.py        # 端到端验证脚本
-│   ├── src/next_edit_server/
-│   │   ├── __main__.py             # CLI 入口
-│   │   ├── server.py               # JSON-RPC over stdio 主循环
-│   │   ├── protocol.py             # 协议消息类型定义
-│   │   ├── document_store.py       # 文档版本管理
-│   │   ├── edit_history.py         # 编辑历史滑动窗口
-│   │   ├── pipeline.py             # 端到端流水线 + 指标采集
-│   │   ├── location/               # 位置预测规则引擎
-│   │   ├── generation/             # NES diff 生成
-│   │   └── inference/              # LLM 推理后端
+│   │   ├── verify_server.py            # 端到端验证脚本
+│   │   └── verify_lsp_path.py          # LSP 路径验证脚本
+│   ├── src/
+│   │   └── next_edit_server/
+│   │       ├── __main__.py             # CLI 入口
+│   │       ├── server.py               # JSON-RPC over stdio 主循环
+│   │       ├── protocol.py             # 协议消息类型定义
+│   │       ├── document_store.py       # 文档版本管理
+│   │       ├── edit_history.py         # 编辑历史滑动窗口
+│   │       ├── pipeline.py             # 端到端流水线 + 指标采集
+│   │       ├── location/
+│   │       │   ├── engine.py           # 规则引擎调度
+│   │       │   ├── rename.py           # 符号重命名传播
+│   │       │   ├── signature.py        # 函数签名变更传播
+│   │       │   └── pattern.py          # 重复模式检测
+│   │       ├── generation/
+│   │       │   ├── generator.py        # NES diff 生成
+│   │       │   └── prompt.py           # prompt 模板 + diff 解析
+│   │       └── inference/
+│   │           └── backend.py          # 推理后端（llama.cpp / Dummy）
 │   └── tests/
+│       ├── test_protocol.py
+│       ├── test_document_store.py
+│       ├── test_location.py
+│       ├── test_generation.py
+│       └── test_pipeline.py
 ├── editors/
-│   └── vscode/                     # VS Code Extension
+│   └── vscode/                         # VS Code Extension
 │       ├── .vscode/
-│       │   ├── launch.json         # F5 调试配置
-│       │   └── tasks.json          # 编译任务
+│       │   ├── launch.json             # F5 调试配置
+│       │   └── tasks.json              # 编译任务
 │       ├── package.json
-│       └── src/extension.ts
-├── issues/                         # 设计文档
-└── talks/                          # 评估报告
+│       ├── tsconfig.json
+│       └── src/
+│           └── extension.ts            # 插件入口
+├── docs/                               # 设计文档
+├── issues/                             # 问题记录
+└── talks/                              # 评估报告
 ```
 
 ## 环境要求
@@ -133,8 +150,53 @@ code --extensionDevelopmentPath="$(pwd)"
 
 1. 打开一个新的 VS Code 窗口（Extension Development Host）
 2. Extension 自动激活，spawn `next-edit-server --stdio` 子进程
-3. 状态栏右下角出现 `NextOne` 指示器
-4. 在新窗口中编辑代码，触发 rename 等场景时会收到 inline diff 建议
+3. 状态栏右下角出现 `✓ NextOne` 指示器（如果显示转圈图标说明握手未完成）
+4. 按以下步骤测试 rename 预测：
+
+**测试步骤**
+
+NextOne 通过检测**编辑动作**来预测下一处修改。它需要看到"从 A 改成 B"这个过程，不是看文件当前的静态内容。测试方法：
+
+1. 新建一个 `.py` 文件，**先输入以下完整内容并保存**：
+
+```python
+def hello(name):
+    return name
+
+hello("world")
+result = hello("test")
+```
+
+2. 用光标选中第 1 行的 `hello`（第 4-9 字符），替换输入为 `hi`
+3. 停顿 1-2 秒，等待服务端分析
+4. 预期效果：第 4 行 `hello("world")` 出现红色（删除）和绿色（新增 `hi("world")`）背景
+5. 按 `Cmd+;` 接受建议，或 `Esc` 拒绝
+
+关键：必须**先有完整内容，再做编辑修改**。如果文件是直接输入最终内容（从未包含过 `hello`），服务端不会检测到 rename 动作。
+
+**排障**
+
+如果状态栏没有出现 `NextOne` 指示器，说明 Extension 没有成功启动服务端。
+
+常见原因是 VS Code GUI 进程不继承终端的 shell profile（pyenv、nvm 等工具注册的 PATH 对 GUI 进程不可见）。Extension 会自动尝试通过用户登录 shell 解析命令路径（`$SHELL -l -c "which next-edit-server"`），但如果解析失败，需要手动配置绝对路径。
+
+查看 Extension 的路径解析结果：`Cmd+Shift+P` → `Output: Show Output Channel` → 选择 `NextOne`，第一行会显示 `Server path: next-edit-server → /解析后的绝对路径`。
+
+如果解析失败（路径没有变成绝对路径），在 VS Code `settings.json` 中手动指定：
+
+```jsonc
+{
+    "nextone.serverPath": "/Users/<username>/.pyenv/versions/3.10.11/bin/next-edit-server"
+}
+```
+
+获取绝对路径的命令：
+
+```bash
+pyenv which next-edit-server
+# 或
+which next-edit-server
+```
 
 ### 方式二：运行验证脚本（推荐的首次验证方式）
 
@@ -325,7 +387,24 @@ Phase 1 MVP，支持的能力：
 
 ## 设计文档
 
+详见 [docs/](./docs/) 目录。
+
+## 问题记录
+
 详见 [issues/](./issues/) 目录。
+
+| 编号 | 标题 | 严重度 |
+|------|------|--------|
+| [001](./issues/001-missing-vscode-debug-config.md) | 缺少 VS Code 调试配置 | 高 |
+| [002](./issues/002-gui-process-path-resolution.md) | VS Code GUI 进程找不到 next-edit-server | 高 |
+| [003](./issues/003-lsp-initialize-not-handled.md) | 服务端不处理 LSP initialize 请求 | 高 |
+| [004](./issues/004-pipeline-init-before-handshake.md) | pipeline.initialize() 在 LSP 握手前执行 | 中 |
+| [005](./issues/005-accept-suggestion-overlapping-replace.md) | acceptSuggestion 对同一行做两次 editBuilder.replace | 高 |
+| [006](./issues/006-lsp-didchange-timestamp-zero.md) | LSP 路径下 didChange 的 timestamp 固定为 0 | 低 |
+| [007](./issues/007-multi-content-changes-silent-drop.md) | 多个 contentChanges 时只处理第一个且无日志 | 低 |
+| [008](./issues/008-new-lines-extraction-wrong.md) | _handle_did_change 中 new_lines 提取错误 | 高 |
+| [009](./issues/009-charwise-input-rename-detection.md) | 逐字输入新名称时无法检测 rename | 高 |
+| [010](./issues/010-parse-nes-diff-strips-indentation.md) | parse_nes_diff 中 strip() 去掉了代码缩进 | 中 |
 
 ## 技术参考
 

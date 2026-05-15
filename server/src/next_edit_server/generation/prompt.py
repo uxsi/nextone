@@ -108,6 +108,17 @@ NES diff format: {{line_num}}-| {{old_content}} and {{line_num}}+| {{new_content
 """
 
 
+def _remove_separator_space(s: str) -> str:
+    """Remove exactly one leading space (the NES format separator after '|').
+
+    '| hello("world")'  →  ' hello("world")'  (split gives ' hello...')
+    We remove the first space only, preserving code indentation.
+    """
+    if s.startswith(" "):
+        return s[1:]
+    return s
+
+
 def parse_nes_diff(diff_text: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Parse NES diff output into deleted and added line lists.
 
@@ -124,11 +135,14 @@ def parse_nes_diff(diff_text: str) -> tuple[list[dict[str, Any]], list[dict[str,
             continue
 
         # Parse: {num}-| {text} or {num}+| {text} or {num} | {text}
+        # After split on "-|" or "+|", the remainder starts with " {text}"
+        # (one space separator per NES format). Remove exactly that one space,
+        # preserving the original indentation of the code.
         if "-|" in line:
             parts = line.split("-|", 1)
             try:
                 num = int(parts[0].strip())
-                text = parts[1].strip() if len(parts) > 1 else ""
+                text = _remove_separator_space(parts[1]) if len(parts) > 1 else ""
                 deleted.append({"num": num, "text": text})
             except ValueError:
                 continue
@@ -136,7 +150,7 @@ def parse_nes_diff(diff_text: str) -> tuple[list[dict[str, Any]], list[dict[str,
             parts = line.split("+|", 1)
             try:
                 num = int(parts[0].strip())
-                text = parts[1].strip() if len(parts) > 1 else ""
+                text = _remove_separator_space(parts[1]) if len(parts) > 1 else ""
                 added.append({"num": num, "text": text})
             except ValueError:
                 continue

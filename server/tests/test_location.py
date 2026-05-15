@@ -221,3 +221,42 @@ z = 3
     engine = LocationEngine(confidence_threshold=0.5)
     pred = engine.predict(edit, source, "python")
     assert pred is None
+
+
+def test_engine_composite_rename_from_history():
+    """Simulate real user behavior: select 'hello', delete, type 'good' char by char."""
+    source = """def good(name):
+    return name
+
+hello("world")
+result = hello("test")
+"""
+    # Edit history: delete "hello" then type g, o, o, d
+    history = [
+        EditRecord(
+            uri="file:///a.py", version=2, timestamp=0,
+            old_lines=["def hello(name):"],
+            new_lines=["def (name):"],
+            start_line=0, end_line=1,
+        ),
+        EditRecord(
+            uri="file:///a.py", version=3, timestamp=0,
+            old_lines=["def (name):"],
+            new_lines=["def g(name):"],
+            start_line=0, end_line=1,
+        ),
+        EditRecord(
+            uri="file:///a.py", version=4, timestamp=0,
+            old_lines=["def goo(name):"],
+            new_lines=["def good(name):"],
+            start_line=0, end_line=1,
+        ),
+    ]
+
+    engine = LocationEngine(confidence_threshold=0.5)
+    pred = engine.predict(history[-1], source, "python", edit_history=history)
+    assert pred is not None
+    assert pred.rule == RuleType.RENAME
+    assert pred.context["old_name"] == "hello"
+    assert pred.context["new_name"] == "good"
+    assert pred.line == 3  # First reference to "hello"

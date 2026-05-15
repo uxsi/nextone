@@ -54,6 +54,15 @@ def test_parse_nes_diff():
     assert added[0]["text"] == 'print("Goodbye")'
 
 
+def test_parse_nes_diff_preserves_indentation():
+    diff_text = """4-|     hello("world")
+4+|     goodbye("world")"""
+
+    deleted, added = parse_nes_diff(diff_text)
+    assert deleted[0]["text"] == '    hello("world")'
+    assert added[0]["text"] == '    goodbye("world")'
+
+
 def test_parse_nes_diff_empty():
     deleted, added = parse_nes_diff("")
     assert deleted == []

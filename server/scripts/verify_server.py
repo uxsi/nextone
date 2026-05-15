@@ -76,16 +76,40 @@ def main() -> None:
     )
 
     try:
-        # 等待服务端初始化
-        time.sleep(0.5)
+        # 等待服务端就绪
+        time.sleep(0.3)
 
-        # 读取启动消息（loading_model → ready）
-        init_msgs = read_messages(proc, timeout=2.0)
+        # 1a. 发送 LSP initialize request（服务端要求握手后才发 notification）
+        print("    发送 LSP initialize 请求...")
+        send_message(proc, {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "processId": None,
+                "capabilities": {},
+                "rootUri": None,
+            },
+        })
+
+        # 读取 initialize response + 后续 status notifications
+        init_msgs = read_messages(proc, timeout=3.0)
         print(f"    收到 {len(init_msgs)} 条初始化消息：")
         for msg in init_msgs:
-            method = msg.get("method", "?")
+            method = msg.get("method", "")
             state = msg.get("params", {}).get("state", "")
-            print(f"    ← {method} (state={state})")
+            if "result" in msg:
+                print(f"    ← initialize response (id={msg.get('id')})")
+            elif method:
+                print(f"    ← {method} (state={state})")
+
+        # 1b. 发送 initialized notification
+        send_message(proc, {
+            "jsonrpc": "2.0",
+            "method": "initialized",
+            "params": {},
+        })
+        time.sleep(0.2)
 
         # 2. 发送 didOpen
         print("\n[2] 发送 didOpen（打开包含 hello 函数的 Python 文件）...")

@@ -61,13 +61,15 @@ class NextEditServer:
         self._stdout = stdout or sys.stdout.buffer
         self._running = True
 
-        # Initialize the pipeline
+        # Create the pipeline but do NOT initialize yet.
+        # pipeline.initialize() sends status notifications, which are
+        # forbidden before the LSP initialize handshake completes.
+        # It will be called from _handle_initialize() after the response.
         self._pipeline = Pipeline(
             document_store=self.document_store,
             send_notification=self.send_notification,
             model_path=self._model_path,
         )
-        self._pipeline.initialize()
 
         while self._running:
             msg = self._read_message()
@@ -90,6 +92,26 @@ class NextEditServer:
 
     def _dispatch(self, msg: JsonRpcMessage) -> None:
         """Route a parsed message to the appropriate handler."""
+
+        logger.debug("RECV method=%s id=%s", msg.method, msg.id)
+
+        # Handle standard LSP lifecycle messages that LanguageClient requires.
+        # LanguageClient sends "initialize" (request) first, then "initialized"
+        # (notification). The server must respond to "initialize" before the
+        # client will send any further messages.
+        if msg.method == "initialize" and msg.is_request:
+            self._handle_initialize(msg)
+            return
+        if msg.method == "initialized":
+            logger.info("Client initialized")
+            return
+        if msg.method == "shutdown" and msg.is_request:
+            self._handle_shutdown(msg)
+            return
+        if msg.method == "exit":
+            self._running = False
+            return
+
         handlers: dict[str, Callable[[dict[str, Any]], None]] = {
             Methods.DID_OPEN: self._handle_did_open,
             Methods.DID_CHANGE: self._handle_did_change,
@@ -99,13 +121,114 @@ class NextEditServer:
             Methods.RESOLVE: self._handle_resolve,
         }
 
-        if msg.method and msg.method in handlers:
+        # Also handle standard LSP textDocument notifications that
+        # LanguageClient sends automatically based on documentSelector.
+        lsp_to_custom: dict[str, str] = {
+            "textDocument/didOpen": Methods.DID_OPEN,
+            "textDocument/didChange": Methods.DID_CHANGE,
+            "textDocument/didSave": Methods.DID_SAVE,
+            "textDocument/didClose": Methods.DID_CLOSE,
+        }
+
+        method = msg.method
+        if method and method in lsp_to_custom:
+            # Translate standard LSP params to our custom format
+            params = self._translate_lsp_params(method, msg.params or {})
             try:
-                handlers[msg.method](msg.params or {})
+                handlers[lsp_to_custom[method]](params)
             except Exception:
-                logger.exception("Error handling %s", msg.method)
-        elif msg.method:
-            logger.warning("Unknown method: %s", msg.method)
+                logger.exception("Error handling %s", method)
+            return
+
+        if method and method in handlers:
+            try:
+                handlers[method](msg.params or {})
+            except Exception:
+                logger.exception("Error handling %s", method)
+        elif method:
+            logger.debug("Unhandled method: %s", method)
+
+    # -----------------------------------------------------------------------
+    # LSP lifecycle handlers
+    # -----------------------------------------------------------------------
+
+    def _handle_initialize(self, msg: JsonRpcMessage) -> None:
+        """Respond to LSP initialize request.
+
+        LanguageClient blocks until it receives this response. We advertise
+        textDocumentSync so the client sends didOpen/didChange/didSave/didClose.
+        """
+        result = {
+            "capabilities": {
+                "textDocumentSync": {
+                    "openClose": True,
+                    "change": 2,  # Incremental
+                    "save": {"includeText": False},
+                },
+            },
+        }
+        self._write_message({
+            "jsonrpc": "2.0",
+            "id": msg.id,
+            "result": result,
+        })
+        logger.info("LSP initialize complete (id=%s)", msg.id)
+
+        # Now that the handshake is done, initialize the pipeline.
+        # This sends loading_model → ready status notifications to the client.
+        if self._pipeline:
+            self._pipeline.initialize()
+
+    def _handle_shutdown(self, msg: JsonRpcMessage) -> None:
+        """Respond to LSP shutdown request."""
+        self._write_message({
+            "jsonrpc": "2.0",
+            "id": msg.id,
+            "result": None,
+        })
+        logger.info("Shutdown requested")
+
+    # -----------------------------------------------------------------------
+    # LSP param translation
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _translate_lsp_params(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Translate standard LSP notification params to our custom format.
+
+        LSP wraps everything under textDocument.uri, textDocument.version, etc.
+        Our handlers expect flat params: uri, version, changes, etc.
+        """
+        text_doc = params.get("textDocument", {})
+
+        if method == "textDocument/didOpen":
+            return {
+                "uri": text_doc.get("uri", ""),
+                "languageId": text_doc.get("languageId", ""),
+                "version": text_doc.get("version", 1),
+                "text": text_doc.get("text", ""),
+            }
+
+        if method == "textDocument/didChange":
+            return {
+                "uri": text_doc.get("uri", ""),
+                "version": text_doc.get("version", 0),
+                "changes": params.get("contentChanges", []),
+                "timestamp": int(time.time() * 1000),
+            }
+
+        if method == "textDocument/didSave":
+            return {
+                "uri": text_doc.get("uri", ""),
+                "version": text_doc.get("version", 0),
+            }
+
+        if method == "textDocument/didClose":
+            return {
+                "uri": text_doc.get("uri", ""),
+            }
+
+        return params
 
     # -----------------------------------------------------------------------
     # Handler implementations
@@ -118,34 +241,55 @@ class NextEditServer:
 
     def _handle_did_change(self, params: dict[str, Any]) -> None:
         p = _parse_did_change(params)
+        logger.info(
+            "didChange: uri=%s version=%d changes=%d",
+            p.uri, p.version, len(p.changes),
+        )
 
         # Capture old lines before applying changes (for edit history)
         doc = self.document_store.get(p.uri)
+        if doc is None:
+            logger.warning("didChange for unknown document: %s (not in document_store)", p.uri)
+            return
+
         old_lines_snapshot: list[str] = []
         change_start = 0
         change_end = 0
-        if doc and p.changes:
+        if p.changes:
+            if len(p.changes) > 1:
+                logger.debug(
+                    "didChange has %d changes, only processing the first one",
+                    len(p.changes),
+                )
             first_change = p.changes[0]
             change_start = first_change.range.start.line
             change_end = first_change.range.end.line + 1
             old_lines_snapshot = doc.get_range(change_start, change_end)
+            logger.info(
+                "  change: range=(%d,%d)-(%d,%d) text=%r",
+                first_change.range.start.line, first_change.range.start.character,
+                first_change.range.end.line, first_change.range.end.character,
+                first_change.text[:80],
+            )
 
         doc = self.document_store.apply_changes(p.uri, p.version, p.changes)
         if doc is None:
-            logger.warning("didChange for unknown document: %s", p.uri)
+            logger.warning("apply_changes returned None for %s", p.uri)
             return
         logger.debug("Changed %s → v%d", p.uri, p.version)
 
         # Capture new lines from the updated document.
-        # change.text is only the replacement fragment (e.g., "goodbye"),
-        # not the full line (e.g., "def goodbye(name):"). We need full lines
-        # so that detect_rename can compare old_lines and new_lines symmetrically.
         new_lines_snapshot: list[str] = []
         if p.changes:
             first_change = p.changes[0]
             new_line_count = first_change.text.count("\n") + 1
             new_end = change_start + new_line_count
             new_lines_snapshot = doc.get_range(change_start, new_end)
+
+        logger.info(
+            "  old_lines=%r new_lines=%r start=%d end=%d",
+            old_lines_snapshot, new_lines_snapshot, change_start, change_end,
+        )
 
         # Trigger the pipeline
         if self._pipeline:
@@ -158,6 +302,8 @@ class NextEditServer:
                 end_line=change_end,
                 timestamp=p.timestamp,
             )
+        else:
+            logger.warning("Pipeline not initialized, ignoring didChange")
 
     def _handle_did_save(self, params: dict[str, Any]) -> None:
         uri = params.get("uri", "")
