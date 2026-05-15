@@ -4,4 +4,4 @@ node_modules/
 .env
 .yarn
 .obsidian/
-__pycache__
+__pycache__/
