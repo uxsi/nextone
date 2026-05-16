@@ -54,6 +54,7 @@ const node_1 = require("vscode-languageclient/node");
 let client;
 let statusBarItem;
 let currentSuggestion = null;
+let suggestionEditor = null;
 // Decoration types for inline diff rendering
 const deletionDecorType = vscode.window.createTextEditorDecorationType({
     backgroundColor: "rgba(255, 0, 0, 0.15)",
@@ -85,7 +86,7 @@ function activate(context) {
     context.subscriptions.push(outputChannel);
     // Build server args — always log to file for diagnostics
     const logFile = "/tmp/next-edit-server.log";
-    const serverArgs = ["--stdio", "--log-level", "DEBUG", "--log-file", logFile];
+    const serverArgs = ["--stdio", "--log-level", logLevel, "--log-file", logFile];
     if (modelPath) {
         serverArgs.push("--model-path", modelPath);
     }
@@ -97,8 +98,20 @@ function activate(context) {
         transport: node_1.TransportKind.stdio,
     };
     const clientOptions = {
-        // We handle document sync ourselves via custom methods
         documentSelector: [{ scheme: "file" }],
+        // Prevent LanguageClient from closing documents when the user switches tabs.
+        // By default, LanguageClient sends didClose when a tab becomes non-active
+        // and didOpen when it becomes active again. This means the server's
+        // DocumentStore only ever contains one file, breaking cross-file prediction.
+        //
+        // We suppress didClose here. When the tab is re-activated, LanguageClient
+        // sends didOpen again which is fine (server.document_store.open() overwrites).
+        // Documents are truly closed only when the workspace event fires.
+        middleware: {
+            didClose: async (_document, _next) => {
+                // Intentionally not forwarding — keep the document alive in the server
+            },
+        },
     };
     client = new node_1.LanguageClient("nextEdit", "NextOne", serverOptions, clientOptions);
     // 2. Status bar
@@ -126,17 +139,68 @@ function activate(context) {
             clearSuggestion();
         }
     }));
+    // 4b. Re-render decorations when switching back to the suggestion's editor.
+    // VS Code may recycle TextEditor instances for non-visible tabs, losing
+    // decorations. When the user switches back, we re-apply them.
+    context.subscriptions.push(vscode.window.onDidChangeActiveTextEditor((editor) => {
+        if (editor &&
+            currentSuggestion &&
+            editor.document.uri.toString() === currentSuggestion.uri) {
+            suggestionEditor = editor;
+            renderSuggestionDecorations(editor, currentSuggestion);
+        }
+    }));
+    // 4c. Send didClose only when a document is truly removed from the workspace.
+    // The middleware above suppresses LanguageClient's automatic didClose on tab
+    // switch. We must handle real closes ourselves.
+    context.subscriptions.push(vscode.workspace.onDidCloseTextDocument((document) => {
+        if (client && document.uri.scheme === "file") {
+            client.sendNotification("textDocument/didClose", {
+                textDocument: { uri: document.uri.toString() },
+            });
+        }
+    }));
     // 5. Register accept/reject commands
     context.subscriptions.push(vscode.commands.registerCommand("nextEdit.accept", () => {
         acceptSuggestion();
     }), vscode.commands.registerCommand("nextEdit.reject", () => {
         rejectSuggestion();
     }));
-    // 6. Start client
-    // LanguageClient automatically sends textDocument/didOpen, didChange,
-    // didSave, didClose for files matching documentSelector. The server
-    // translates these standard LSP messages to our custom format.
-    client.start();
+    // 6. Start client and sync all open documents.
+    // LanguageClient's default document sync only tracks the active editor.
+    // For cross-file prediction, the server needs all open files in its
+    // DocumentStore. After the client is ready, we manually send didOpen
+    // for every file-scheme document already open in the workspace.
+    client.start().then(() => {
+        for (const doc of vscode.workspace.textDocuments) {
+            if (doc.uri.scheme === "file" && !doc.isClosed) {
+                client.sendNotification("textDocument/didOpen", {
+                    textDocument: {
+                        uri: doc.uri.toString(),
+                        languageId: doc.languageId,
+                        version: doc.version,
+                        text: doc.getText(),
+                    },
+                });
+            }
+        }
+    });
+    // Also send didOpen for any file opened after client startup.
+    // This covers files the user opens after the extension activates,
+    // including files that LanguageClient would not auto-open because
+    // another tab already has focus.
+    context.subscriptions.push(vscode.workspace.onDidOpenTextDocument((doc) => {
+        if (client && doc.uri.scheme === "file") {
+            client.sendNotification("textDocument/didOpen", {
+                textDocument: {
+                    uri: doc.uri.toString(),
+                    languageId: doc.languageId,
+                    version: doc.version,
+                    text: doc.getText(),
+                },
+            });
+        }
+    }));
 }
 function deactivate() {
     if (!client) {
@@ -159,13 +223,8 @@ function handleSuggestion(params) {
     if (!editor || editor.document.uri.toString() !== params.uri) {
         return;
     }
-    // Render deleted lines (red background)
-    const deletionRanges = params.deletedLines.map((l) => new vscode.Range(l.num - 1, 0, l.num - 1, Number.MAX_SAFE_INTEGER));
-    editor.setDecorations(deletionDecorType, deletionRanges);
-    // Render added lines (green background)
-    // For added lines we highlight the same line numbers
-    const additionRanges = params.addedLines.map((l) => new vscode.Range(l.num - 1, 0, l.num - 1, Number.MAX_SAFE_INTEGER));
-    editor.setDecorations(additionDecorType, additionRanges);
+    suggestionEditor = editor;
+    renderSuggestionDecorations(editor, params);
     // Scroll to the suggestion location
     const targetPos = new vscode.Position(params.location.line, 0);
     editor.revealRange(new vscode.Range(targetPos, targetPos), vscode.TextEditorRevealType.InCenterIfOutsideViewport);
@@ -174,12 +233,25 @@ function handleSuggestion(params) {
     // Show description in status bar
     statusBarItem.text = `$(lightbulb) ${params.description}`;
 }
+/**
+ * Apply deletion/addition decorations to an editor for the given suggestion.
+ * Called both on initial render and when switching back to the suggestion's tab.
+ */
+function renderSuggestionDecorations(editor, params) {
+    const deletionRanges = params.deletedLines.map((l) => new vscode.Range(l.num - 1, 0, l.num - 1, Number.MAX_SAFE_INTEGER));
+    editor.setDecorations(deletionDecorType, deletionRanges);
+    const additionRanges = params.addedLines.map((l) => new vscode.Range(l.num - 1, 0, l.num - 1, Number.MAX_SAFE_INTEGER));
+    editor.setDecorations(additionDecorType, additionRanges);
+}
 function clearSuggestion() {
-    const editor = vscode.window.activeTextEditor;
+    // Clear decorations on the editor where the suggestion was rendered,
+    // not necessarily the current activeTextEditor (user may have switched tabs).
+    const editor = suggestionEditor ?? vscode.window.activeTextEditor;
     if (editor) {
         editor.setDecorations(deletionDecorType, []);
         editor.setDecorations(additionDecorType, []);
     }
+    suggestionEditor = null;
     currentSuggestion = null;
     vscode.commands.executeCommand("setContext", "nextEdit.hasSuggestion", false);
 }
@@ -190,8 +262,15 @@ function acceptSuggestion() {
     if (!currentSuggestion) {
         return;
     }
-    const editor = vscode.window.activeTextEditor;
+    // Use the editor where the suggestion was rendered, not activeTextEditor
+    // (user may have switched tabs since the suggestion appeared).
+    const editor = suggestionEditor ?? vscode.window.activeTextEditor;
     if (!editor) {
+        return;
+    }
+    // Safety: verify the editor's document matches the suggestion target
+    if (editor.document.uri.toString() !== currentSuggestion.uri) {
+        clearSuggestion();
         return;
     }
     const suggestion = currentSuggestion;

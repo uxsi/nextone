@@ -252,25 +252,28 @@ class NextEditServer:
             logger.warning("didChange for unknown document: %s (not in document_store)", p.uri)
             return
 
-        old_lines_snapshot: list[str] = []
-        change_start = 0
-        change_end = 0
-        if p.changes:
-            if len(p.changes) > 1:
-                logger.debug(
-                    "didChange has %d changes, only processing the first one",
-                    len(p.changes),
-                )
-            first_change = p.changes[0]
-            change_start = first_change.range.start.line
-            change_end = first_change.range.end.line + 1
-            old_lines_snapshot = doc.get_range(change_start, change_end)
+        # Multi-change events (multi-cursor, batch replace, snippets, etc.)
+        # produce multiple contentChanges in a single didChange. We sync the
+        # document state but skip the suggestion pipeline to avoid recording
+        # a misleading edit history entry.
+        if len(p.changes) != 1:
             logger.info(
-                "  change: range=(%d,%d)-(%d,%d) text=%r",
-                first_change.range.start.line, first_change.range.start.character,
-                first_change.range.end.line, first_change.range.end.character,
-                first_change.text[:80],
+                "didChange has %d changes, syncing document only (skipping pipeline)",
+                len(p.changes),
             )
+            self.document_store.apply_changes(p.uri, p.version, p.changes)
+            return
+
+        first_change = p.changes[0]
+        change_start = first_change.range.start.line
+        change_end = first_change.range.end.line + 1
+        old_lines_snapshot = doc.get_range(change_start, change_end)
+        logger.info(
+            "  change: range=(%d,%d)-(%d,%d) text=%r",
+            first_change.range.start.line, first_change.range.start.character,
+            first_change.range.end.line, first_change.range.end.character,
+            first_change.text[:80],
+        )
 
         doc = self.document_store.apply_changes(p.uri, p.version, p.changes)
         if doc is None:
@@ -279,12 +282,9 @@ class NextEditServer:
         logger.debug("Changed %s → v%d", p.uri, p.version)
 
         # Capture new lines from the updated document.
-        new_lines_snapshot: list[str] = []
-        if p.changes:
-            first_change = p.changes[0]
-            new_line_count = first_change.text.count("\n") + 1
-            new_end = change_start + new_line_count
-            new_lines_snapshot = doc.get_range(change_start, new_end)
+        new_line_count = first_change.text.count("\n") + 1
+        new_end = change_start + new_line_count
+        new_lines_snapshot = doc.get_range(change_start, new_end)
 
         logger.info(
             "  old_lines=%r new_lines=%r start=%d end=%d",

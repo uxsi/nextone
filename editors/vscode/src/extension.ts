@@ -56,6 +56,7 @@ interface StatusParams {
 let client: LanguageClient;
 let statusBarItem: vscode.StatusBarItem;
 let currentSuggestion: SuggestParams | null = null;
+let suggestionEditor: vscode.TextEditor | null = null;
 
 // Decoration types for inline diff rendering
 const deletionDecorType = vscode.window.createTextEditorDecorationType({
@@ -94,7 +95,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   // Build server args — always log to file for diagnostics
   const logFile = "/tmp/next-edit-server.log";
-  const serverArgs = ["--stdio", "--log-level", "DEBUG", "--log-file", logFile];
+  const serverArgs = ["--stdio", "--log-level", logLevel, "--log-file", logFile];
   if (modelPath) {
     serverArgs.push("--model-path", modelPath);
   }
@@ -159,6 +160,22 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
   );
 
+  // 4b. Re-render decorations when switching back to the suggestion's editor.
+  // VS Code may recycle TextEditor instances for non-visible tabs, losing
+  // decorations. When the user switches back, we re-apply them.
+  context.subscriptions.push(
+    vscode.window.onDidChangeActiveTextEditor((editor) => {
+      if (
+        editor &&
+        currentSuggestion &&
+        editor.document.uri.toString() === currentSuggestion.uri
+      ) {
+        suggestionEditor = editor;
+        renderSuggestionDecorations(editor, currentSuggestion);
+      }
+    }),
+  );
+
   // 5. Register accept/reject commands
   context.subscriptions.push(
     vscode.commands.registerCommand("nextEdit.accept", () => {
@@ -203,31 +220,9 @@ function handleSuggestion(params: SuggestParams): void {
   if (!editor || editor.document.uri.toString() !== params.uri) {
     return;
   }
+  suggestionEditor = editor;
 
-  // Render deleted lines (red background)
-  const deletionRanges = params.deletedLines.map(
-    (l) =>
-      new vscode.Range(
-        l.num - 1,
-        0,
-        l.num - 1,
-        Number.MAX_SAFE_INTEGER,
-      ),
-  );
-  editor.setDecorations(deletionDecorType, deletionRanges);
-
-  // Render added lines (green background)
-  // For added lines we highlight the same line numbers
-  const additionRanges = params.addedLines.map(
-    (l) =>
-      new vscode.Range(
-        l.num - 1,
-        0,
-        l.num - 1,
-        Number.MAX_SAFE_INTEGER,
-      ),
-  );
-  editor.setDecorations(additionDecorType, additionRanges);
+  renderSuggestionDecorations(editor, params);
 
   // Scroll to the suggestion location
   const targetPos = new vscode.Position(params.location.line, 0);
@@ -243,12 +238,46 @@ function handleSuggestion(params: SuggestParams): void {
   statusBarItem.text = `$(lightbulb) ${params.description}`;
 }
 
+/**
+ * Apply deletion/addition decorations to an editor for the given suggestion.
+ * Called both on initial render and when switching back to the suggestion's tab.
+ */
+function renderSuggestionDecorations(
+  editor: vscode.TextEditor,
+  params: SuggestParams,
+): void {
+  const deletionRanges = params.deletedLines.map(
+    (l) =>
+      new vscode.Range(
+        l.num - 1,
+        0,
+        l.num - 1,
+        Number.MAX_SAFE_INTEGER,
+      ),
+  );
+  editor.setDecorations(deletionDecorType, deletionRanges);
+
+  const additionRanges = params.addedLines.map(
+    (l) =>
+      new vscode.Range(
+        l.num - 1,
+        0,
+        l.num - 1,
+        Number.MAX_SAFE_INTEGER,
+      ),
+  );
+  editor.setDecorations(additionDecorType, additionRanges);
+}
+
 function clearSuggestion(): void {
-  const editor = vscode.window.activeTextEditor;
+  // Clear decorations on the editor where the suggestion was rendered,
+  // not necessarily the current activeTextEditor (user may have switched tabs).
+  const editor = suggestionEditor ?? vscode.window.activeTextEditor;
   if (editor) {
     editor.setDecorations(deletionDecorType, []);
     editor.setDecorations(additionDecorType, []);
   }
+  suggestionEditor = null;
   currentSuggestion = null;
   vscode.commands.executeCommand("setContext", "nextEdit.hasSuggestion", false);
 }
@@ -262,8 +291,16 @@ function acceptSuggestion(): void {
     return;
   }
 
-  const editor = vscode.window.activeTextEditor;
+  // Use the editor where the suggestion was rendered, not activeTextEditor
+  // (user may have switched tabs since the suggestion appeared).
+  const editor = suggestionEditor ?? vscode.window.activeTextEditor;
   if (!editor) {
+    return;
+  }
+
+  // Safety: verify the editor's document matches the suggestion target
+  if (editor.document.uri.toString() !== currentSuggestion.uri) {
+    clearSuggestion();
     return;
   }
 

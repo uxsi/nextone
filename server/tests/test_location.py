@@ -260,3 +260,76 @@ result = hello("test")
     assert pred.context["old_name"] == "hello"
     assert pred.context["new_name"] == "good"
     assert pred.line == 3  # First reference to "hello"
+
+
+def test_engine_composite_rename_rejects_different_uri():
+    """Composite rename must not merge edits from different files."""
+    source = """def good(name):
+    return name
+
+hello("world")
+"""
+    history = [
+        EditRecord(
+            uri="file:///a.py", version=2, timestamp=0,
+            old_lines=["def hello(name):"],
+            new_lines=["def (name):"],
+            start_line=0, end_line=1,
+        ),
+        EditRecord(
+            uri="file:///b.py", version=3, timestamp=0,
+            old_lines=["def (name):"],
+            new_lines=["def g(name):"],
+            start_line=0, end_line=1,
+        ),
+        EditRecord(
+            uri="file:///a.py", version=4, timestamp=0,
+            old_lines=["def goo(name):"],
+            new_lines=["def good(name):"],
+            start_line=0, end_line=1,
+        ),
+    ]
+
+    engine = LocationEngine(confidence_threshold=0.5)
+    pred = engine.predict(history[-1], source, "python", edit_history=history)
+    # Should fall through to single-edit rename (not composite), or return a
+    # prediction based on the last edit alone — but NOT a composite rename
+    # merging edits from different uris.
+    if pred is not None:
+        # If it fires, it must be from single-edit detection on the last edit,
+        # not from composite history merging.
+        assert pred.context.get("old_name") != "hello"
+
+
+def test_engine_composite_rename_rejects_different_lines():
+    """Composite rename must not merge edits on different lines."""
+    source = """def good(name):
+    return name
+
+hello("world")
+"""
+    history = [
+        EditRecord(
+            uri="file:///a.py", version=2, timestamp=0,
+            old_lines=["def hello(name):"],
+            new_lines=["def (name):"],
+            start_line=0, end_line=1,
+        ),
+        EditRecord(
+            uri="file:///a.py", version=3, timestamp=0,
+            old_lines=["    return name"],
+            new_lines=["    return value"],
+            start_line=1, end_line=2,
+        ),
+        EditRecord(
+            uri="file:///a.py", version=4, timestamp=0,
+            old_lines=["def goo(name):"],
+            new_lines=["def good(name):"],
+            start_line=0, end_line=1,
+        ),
+    ]
+
+    engine = LocationEngine(confidence_threshold=0.5)
+    pred = engine.predict(history[-1], source, "python", edit_history=history)
+    if pred is not None:
+        assert pred.context.get("old_name") != "hello"

@@ -224,14 +224,27 @@ class LocationEngine:
 
         We compare the first edit's old_lines against the last edit's new_lines
         to synthesize a single "composite" rename detection.
+
+        All edits in the history window must target the same uri and line, with
+        single-line changes only. This prevents unrelated edits on different
+        files or lines from being incorrectly merged into a composite rename.
         """
-        # All edits must be on the same line
         first = edit_history[0]
         last = edit_history[-1]
-        if first.start_line != last.start_line:
-            return None
-        if len(first.old_lines) != 1 or len(last.new_lines) != 1:
-            return None
+
+        # All edits must target the same uri and line, with single-line changes.
+        # Note: the history window has a fixed small size (e.g. 3). When the user
+        # types more characters than the window size, intermediate edits get evicted,
+        # so we cannot require strict consecutive evolution (edit[i].new_lines ==
+        # edit[i+1].old_lines). Instead we verify structural consistency: same file,
+        # same line, all single-line.
+        for edit in edit_history:
+            if edit.uri != first.uri:
+                return None
+            if edit.start_line != first.start_line:
+                return None
+            if len(edit.old_lines) != 1 or len(edit.new_lines) != 1:
+                return None
 
         # Synthesize a composite edit
         composite = EditRecord(
