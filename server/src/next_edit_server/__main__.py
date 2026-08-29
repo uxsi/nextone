@@ -38,6 +38,13 @@ def main() -> None:
         default=None,
         help="Path to GGUF model file. If not provided, uses a dummy backend for testing.",
     )
+    parser.add_argument(
+        "--workspace",
+        type=str,
+        default=None,
+        help="Workspace root directory for cross-file indexing. "
+             "If not provided, uses rootUri from LSP initialize or infers from git root.",
+    )
     args = parser.parse_args()
 
     # Configure logging (to file or stderr, never stdout — stdout is the RPC channel)
@@ -53,7 +60,7 @@ def main() -> None:
         handlers=log_handlers,
     )
 
-    server = NextEditServer(model_path=args.model_path)
+    server = NextEditServer(model_path=args.model_path, workspace_root=args.workspace)
     server.run()
 
 

@@ -5,8 +5,8 @@
  * Thin plugin layer that:
  * 1. Spawns next-edit-server as a child process (JSON-RPC over stdio)
  * 2. Forwards edit events (didOpen, didChange, didClose) to the server
- * 3. Renders inline diff suggestions from the server
- * 4. Handles accept/reject interaction
+ * 3. Renders inline hint suggestions (after pseudo-element at cursor line end)
+ * 4. Handles accept/reject interaction — including cross-file suggestions
  */
 var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
     if (k2 === undefined) k2 = k;
@@ -47,6 +47,7 @@ exports.deactivate = deactivate;
 const vscode = __importStar(require("vscode"));
 const cp = __importStar(require("child_process"));
 const os = __importStar(require("os"));
+const path = __importStar(require("path"));
 const node_1 = require("vscode-languageclient/node");
 // ---------------------------------------------------------------------------
 // Extension state
@@ -55,18 +56,12 @@ let client;
 let statusBarItem;
 let currentSuggestion = null;
 let suggestionEditor = null;
-// Decoration types for inline diff rendering
-const deletionDecorType = vscode.window.createTextEditorDecorationType({
-    backgroundColor: "rgba(255, 0, 0, 0.15)",
-    isWholeLine: true,
-    overviewRulerColor: "rgba(255, 0, 0, 0.5)",
-    overviewRulerLane: vscode.OverviewRulerLane.Left,
-});
-const additionDecorType = vscode.window.createTextEditorDecorationType({
-    backgroundColor: "rgba(0, 255, 0, 0.15)",
-    isWholeLine: true,
-    overviewRulerColor: "rgba(0, 255, 0, 0.5)",
-    overviewRulerLane: vscode.OverviewRulerLane.Left,
+// Decoration type for inline hint at cursor line end.
+// Uses `after` pseudo-element — zero impact on layout: no inserted characters,
+// no extra lines, no shifted content. Pure render-layer overlay.
+const hintDecorType = vscode.window.createTextEditorDecorationType({
+    rangeBehavior: vscode.DecorationRangeBehavior.ClosedClosed,
+    // No backgroundColor, isWholeLine, or before — zero layout side-effects
 });
 // ---------------------------------------------------------------------------
 // Activation
@@ -98,20 +93,8 @@ function activate(context) {
         transport: node_1.TransportKind.stdio,
     };
     const clientOptions = {
+        // We handle document sync ourselves via custom methods
         documentSelector: [{ scheme: "file" }],
-        // Prevent LanguageClient from closing documents when the user switches tabs.
-        // By default, LanguageClient sends didClose when a tab becomes non-active
-        // and didOpen when it becomes active again. This means the server's
-        // DocumentStore only ever contains one file, breaking cross-file prediction.
-        //
-        // We suppress didClose here. When the tab is re-activated, LanguageClient
-        // sends didOpen again which is fine (server.document_store.open() overwrites).
-        // Documents are truly closed only when the workspace event fires.
-        middleware: {
-            didClose: async (_document, _next) => {
-                // Intentionally not forwarding — keep the document alive in the server
-            },
-        },
     };
     client = new node_1.LanguageClient("nextEdit", "NextOne", serverOptions, clientOptions);
     // 2. Status bar
@@ -133,31 +116,28 @@ function activate(context) {
     });
     // 4. Auto-dismiss stale suggestions on document change
     context.subscriptions.push(vscode.workspace.onDidChangeTextDocument((event) => {
-        if (currentSuggestion &&
-            currentSuggestion.baseUri === event.document.uri.toString() &&
+        if (!currentSuggestion) {
+            return;
+        }
+        const changedUri = event.document.uri.toString();
+        // Source file changed → baseVersion is stale
+        if (changedUri === currentSuggestion.baseUri &&
             event.document.version > currentSuggestion.baseVersion) {
+            clearSuggestion();
+            return;
+        }
+        // Target file changed (cross-file) → suggestion no longer valid
+        if (changedUri === currentSuggestion.uri && changedUri !== currentSuggestion.baseUri) {
             clearSuggestion();
         }
     }));
-    // 4b. Re-render decorations when switching back to the suggestion's editor.
-    // VS Code may recycle TextEditor instances for non-visible tabs, losing
-    // decorations. When the user switches back, we re-apply them.
+    // 4b. Re-render hint when switching back to the suggestion's source editor.
     context.subscriptions.push(vscode.window.onDidChangeActiveTextEditor((editor) => {
         if (editor &&
             currentSuggestion &&
-            editor.document.uri.toString() === currentSuggestion.uri) {
+            editor.document.uri.toString() === currentSuggestion.baseUri) {
             suggestionEditor = editor;
-            renderSuggestionDecorations(editor, currentSuggestion);
-        }
-    }));
-    // 4c. Send didClose only when a document is truly removed from the workspace.
-    // The middleware above suppresses LanguageClient's automatic didClose on tab
-    // switch. We must handle real closes ourselves.
-    context.subscriptions.push(vscode.workspace.onDidCloseTextDocument((document) => {
-        if (client && document.uri.scheme === "file") {
-            client.sendNotification("textDocument/didClose", {
-                textDocument: { uri: document.uri.toString() },
-            });
+            renderSuggestionHint(editor, currentSuggestion);
         }
     }));
     // 5. Register accept/reject commands
@@ -166,41 +146,11 @@ function activate(context) {
     }), vscode.commands.registerCommand("nextEdit.reject", () => {
         rejectSuggestion();
     }));
-    // 6. Start client and sync all open documents.
-    // LanguageClient's default document sync only tracks the active editor.
-    // For cross-file prediction, the server needs all open files in its
-    // DocumentStore. After the client is ready, we manually send didOpen
-    // for every file-scheme document already open in the workspace.
-    client.start().then(() => {
-        for (const doc of vscode.workspace.textDocuments) {
-            if (doc.uri.scheme === "file" && !doc.isClosed) {
-                client.sendNotification("textDocument/didOpen", {
-                    textDocument: {
-                        uri: doc.uri.toString(),
-                        languageId: doc.languageId,
-                        version: doc.version,
-                        text: doc.getText(),
-                    },
-                });
-            }
-        }
-    });
-    // Also send didOpen for any file opened after client startup.
-    // This covers files the user opens after the extension activates,
-    // including files that LanguageClient would not auto-open because
-    // another tab already has focus.
-    context.subscriptions.push(vscode.workspace.onDidOpenTextDocument((doc) => {
-        if (client && doc.uri.scheme === "file") {
-            client.sendNotification("textDocument/didOpen", {
-                textDocument: {
-                    uri: doc.uri.toString(),
-                    languageId: doc.languageId,
-                    version: doc.version,
-                    text: doc.getText(),
-                },
-            });
-        }
-    }));
+    // 6. Start client
+    // LanguageClient automatically sends textDocument/didOpen, didChange,
+    // didSave, didClose for files matching documentSelector. The server
+    // translates these standard LSP messages to our custom format.
+    client.start();
 }
 function deactivate() {
     if (!client) {
@@ -209,7 +159,7 @@ function deactivate() {
     return client.stop();
 }
 // ---------------------------------------------------------------------------
-// Suggestion rendering
+// Suggestion rendering — unified for same-file and cross-file
 // ---------------------------------------------------------------------------
 function handleSuggestion(params) {
     // Check if suggestion is already stale
@@ -219,37 +169,58 @@ function handleSuggestion(params) {
     }
     clearSuggestion();
     currentSuggestion = params;
+    // Always render the hint in the current editor (source file)
     const editor = vscode.window.activeTextEditor;
-    if (!editor || editor.document.uri.toString() !== params.uri) {
+    if (!editor || editor.document.uri.toString() !== params.baseUri) {
         return;
     }
     suggestionEditor = editor;
-    renderSuggestionDecorations(editor, params);
-    // Scroll to the suggestion location
-    const targetPos = new vscode.Position(params.location.line, 0);
-    editor.revealRange(new vscode.Range(targetPos, targetPos), vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+    renderSuggestionHint(editor, params);
     // Set context key for when-clause
     vscode.commands.executeCommand("setContext", "nextEdit.hasSuggestion", true);
     // Show description in status bar
-    statusBarItem.text = `$(lightbulb) ${params.description}`;
+    const isCrossFile = params.uri !== params.baseUri;
+    const fileLabel = isCrossFile
+        ? ` [${path.basename(vscode.Uri.parse(params.uri).fsPath)}]`
+        : "";
+    statusBarItem.text = `$(lightbulb) ${params.description}${fileLabel}`;
 }
 /**
- * Apply deletion/addition decorations to an editor for the given suggestion.
- * Called both on initial render and when switching back to the suggestion's tab.
+ * Render the suggestion as an `after` pseudo-element at the cursor line end.
+ *
+ * Zero layout impact: no inserted characters, no extra lines, no shifted content.
+ * The hint text is rendered as a purely visual overlay after the last character
+ * on the cursor line.
  */
-function renderSuggestionDecorations(editor, params) {
-    const deletionRanges = params.deletedLines.map((l) => new vscode.Range(l.num - 1, 0, l.num - 1, Number.MAX_SAFE_INTEGER));
-    editor.setDecorations(deletionDecorType, deletionRanges);
-    const additionRanges = params.addedLines.map((l) => new vscode.Range(l.num - 1, 0, l.num - 1, Number.MAX_SAFE_INTEGER));
-    editor.setDecorations(additionDecorType, additionRanges);
+function renderSuggestionHint(editor, params) {
+    const cursorLine = editor.selection.active.line;
+    const isCrossFile = params.uri !== params.baseUri;
+    const fileName = isCrossFile
+        ? ` in ${path.basename(vscode.Uri.parse(params.uri).fsPath)}`
+        : "";
+    const hintText = `Cmd+; ${params.description}${fileName}`;
+    // Range anchored at the very end of the line — does not cover any existing text
+    const lineEnd = editor.document.lineAt(cursorLine).range.end;
+    const range = new vscode.Range(lineEnd, lineEnd);
+    editor.setDecorations(hintDecorType, [
+        {
+            range,
+            renderOptions: {
+                after: {
+                    contentText: hintText,
+                    color: new vscode.ThemeColor("editorCodeLens.foreground"),
+                    fontStyle: "italic",
+                    margin: "0 0 0 2em",
+                },
+            },
+        },
+    ]);
 }
 function clearSuggestion() {
-    // Clear decorations on the editor where the suggestion was rendered,
-    // not necessarily the current activeTextEditor (user may have switched tabs).
+    // Clear hint decoration on the editor where it was rendered
     const editor = suggestionEditor ?? vscode.window.activeTextEditor;
     if (editor) {
-        editor.setDecorations(deletionDecorType, []);
-        editor.setDecorations(additionDecorType, []);
+        editor.setDecorations(hintDecorType, []);
     }
     suggestionEditor = null;
     currentSuggestion = null;
@@ -258,27 +229,65 @@ function clearSuggestion() {
 // ---------------------------------------------------------------------------
 // Accept / Reject
 // ---------------------------------------------------------------------------
-function acceptSuggestion() {
+async function acceptSuggestion() {
     if (!currentSuggestion) {
         return;
     }
-    // Use the editor where the suggestion was rendered, not activeTextEditor
-    // (user may have switched tabs since the suggestion appeared).
+    const suggestion = currentSuggestion;
+    const isCrossFile = suggestion.uri !== suggestion.baseUri;
+    if (isCrossFile) {
+        await acceptCrossFileSuggestion(suggestion);
+    }
+    else {
+        await acceptSameFileSuggestion(suggestion);
+    }
+    client.sendNotification("nextEdit/resolve", {
+        id: suggestion.id,
+        accepted: true,
+    });
+    clearSuggestion();
+}
+/**
+ * Apply the suggestion to the current (same) file.
+ */
+async function acceptSameFileSuggestion(suggestion) {
     const editor = suggestionEditor ?? vscode.window.activeTextEditor;
     if (!editor) {
         return;
     }
     // Safety: verify the editor's document matches the suggestion target
-    if (editor.document.uri.toString() !== currentSuggestion.uri) {
-        clearSuggestion();
+    if (editor.document.uri.toString() !== suggestion.uri) {
         return;
     }
-    const suggestion = currentSuggestion;
-    // Apply the diff: replace each deleted line with its corresponding added line.
-    // Phase 1 scenarios (rename, signature) produce 1:1 deleted→added mappings
-    // with matching line numbers.
-    editor
-        .edit((editBuilder) => {
+    await applyDiffToEditor(editor, suggestion);
+}
+/**
+ * Apply the suggestion to a different file — silently open, apply, save.
+ * The user's focus stays in the current file.
+ */
+async function acceptCrossFileSuggestion(suggestion) {
+    const targetUri = vscode.Uri.parse(suggestion.uri);
+    try {
+        const doc = await vscode.workspace.openTextDocument(targetUri);
+        // showTextDocument with preserveFocus: true keeps user in current file
+        const editor = await vscode.window.showTextDocument(doc, {
+            viewColumn: vscode.ViewColumn.Beside,
+            preserveFocus: true,
+            preview: true,
+        });
+        await applyDiffToEditor(editor, suggestion);
+        await doc.save();
+    }
+    catch (err) {
+        // File may have been deleted or become unreadable
+        vscode.window.showWarningMessage(`NextOne: Could not apply cross-file suggestion to ${path.basename(targetUri.fsPath)}`);
+    }
+}
+/**
+ * Apply a NES diff suggestion to an editor's document.
+ */
+async function applyDiffToEditor(editor, suggestion) {
+    await editor.edit((editBuilder) => {
         // Build a map: line number → new text
         const replacements = new Map();
         for (let i = 0; i < suggestion.deletedLines.length; i++) {
@@ -296,17 +305,7 @@ function acceptSuggestion() {
                 editBuilder.replace(line.range, newText);
             }
         }
-    })
-        .then((success) => {
-        if (success) {
-            // Notify server
-            client.sendNotification("nextEdit/resolve", {
-                id: suggestion.id,
-                accepted: true,
-            });
-        }
     });
-    clearSuggestion();
 }
 function rejectSuggestion() {
     if (!currentSuggestion) {

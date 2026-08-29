@@ -18,6 +18,12 @@ from .pattern import detect_pattern, find_methods_missing_reference, PatternDete
 
 logger = logging.getLogger("next-edit-server.location")
 
+# Conditional import: ProjectIndex is optional (not available in Phase 1)
+try:
+    from ..project_index import ProjectIndex
+except ImportError:
+    ProjectIndex = None  # type: ignore[misc,assignment]
+
 
 class RuleType(str, Enum):
     RENAME = "rename"
@@ -34,6 +40,7 @@ class LocationPrediction:
     confidence: float     # 0.0 to 1.0
     context: dict[str, Any]  # Rule-specific context (e.g., old_name, new_name for rename)
     text: str             # The line content at the predicted location
+    target_uri: str | None = None  # None = same file, set = cross-file target
 
 
 class LocationEngine:
@@ -41,6 +48,11 @@ class LocationEngine:
 
     def __init__(self, confidence_threshold: float = 0.5) -> None:
         self._threshold = confidence_threshold
+        self._project_index: ProjectIndex | None = None
+
+    def set_project_index(self, index: Any) -> None:
+        """Set the project index for cross-file prediction."""
+        self._project_index = index
 
     def predict(
         self,
@@ -284,3 +296,240 @@ class LocationEngine:
             },
             text=ref.text,
         )
+
+    # -----------------------------------------------------------------------
+    # Cross-file prediction
+    # -----------------------------------------------------------------------
+
+    def predict_cross_file(
+        self,
+        edit: EditRecord,
+        source_code: str,
+        language: str,
+        edit_history: list[EditRecord] | None = None,
+    ) -> list[LocationPrediction]:
+        """Cross-file predictions. Returns ALL predicted locations across other files.
+
+        Called AFTER same-file predict() returns None. Returns predictions
+        sorted by confidence. The pipeline picks the top-1 to suggest.
+
+        Parameters:
+            edit: The most recent edit event.
+            source_code: Current full file content (after the edit).
+            language: Language identifier.
+            edit_history: Full edit history window (oldest first).
+
+        Returns:
+            List of predictions with target_uri set, sorted by confidence.
+            Empty list if project index is not available or not ready.
+        """
+        if self._project_index is None or not self._project_index.is_ready():
+            return []
+
+        predictions: list[LocationPrediction] = []
+
+        # Try cross-file rename (single-edit detection)
+        rename_preds = self._try_cross_file_rename(edit)
+        predictions.extend(rename_preds)
+
+        # Try cross-file rename (multi-edit history detection)
+        if not rename_preds and edit_history and len(edit_history) >= 2:
+            composite_preds = self._try_cross_file_rename_from_history(edit_history)
+            predictions.extend(composite_preds)
+
+        # Try cross-file signature change
+        sig_preds = self._try_cross_file_signature(edit)
+        predictions.extend(sig_preds)
+
+        # Filter by threshold and sort by confidence
+        predictions = [p for p in predictions if p.confidence >= self._threshold]
+        predictions.sort(key=lambda p: p.confidence, reverse=True)
+
+        if predictions:
+            logger.info(
+                "Cross-file predictions: %d candidates (best: %s line %d confidence=%.2f)",
+                len(predictions),
+                predictions[0].target_uri,
+                predictions[0].line,
+                predictions[0].confidence,
+            )
+
+        return predictions
+
+    def _try_cross_file_rename(
+        self, edit: EditRecord,
+    ) -> list[LocationPrediction]:
+        """Find cross-file references to a renamed symbol."""
+        detection = detect_rename(edit)
+        if detection is None:
+            return []
+
+        return self._cross_file_rename_from_detection(detection, edit.uri)
+
+    def _try_cross_file_rename_from_history(
+        self, edit_history: list[EditRecord],
+    ) -> list[LocationPrediction]:
+        """Cross-file rename from composite history (multi-keystroke rename)."""
+        first = edit_history[0]
+        last = edit_history[-1]
+
+        for e in edit_history:
+            if e.uri != first.uri or e.start_line != first.start_line:
+                return []
+            if len(e.old_lines) != 1 or len(e.new_lines) != 1:
+                return []
+
+        composite = EditRecord(
+            uri=last.uri,
+            version=last.version,
+            timestamp=last.timestamp,
+            old_lines=first.old_lines,
+            new_lines=last.new_lines,
+            start_line=first.start_line,
+            end_line=first.end_line,
+        )
+
+        detection = detect_rename(composite)
+        if detection is None:
+            return []
+
+        return self._cross_file_rename_from_detection(detection, first.uri)
+
+    def _cross_file_rename_from_detection(
+        self, detection: RenameDetection, source_uri: str,
+    ) -> list[LocationPrediction]:
+        """Query project index for cross-file references of a rename detection.
+
+        Filters results to only files that import the source module.
+        """
+        assert self._project_index is not None
+
+        refs = self._project_index.query_references(
+            name=detection.old_name,
+            exclude_uri=source_uri,
+        )
+
+        if not refs:
+            return []
+
+        # Extract source module name from URI: file:///path/to/api.py → "api"
+        source_module = self._module_name_from_uri(source_uri)
+
+        # Filter: only keep refs in files that import the source module
+        if source_module:
+            refs = [
+                ref for ref in refs
+                if self._file_imports_module(ref.uri, source_module)
+            ]
+
+        if not refs:
+            return []
+
+        # Group by file, take first reference per file
+        file_refs: dict[str, Any] = {}
+        file_ref_counts: dict[str, int] = {}
+        for ref in refs:
+            file_ref_counts[ref.uri] = file_ref_counts.get(ref.uri, 0) + 1
+            if ref.uri not in file_refs:
+                file_refs[ref.uri] = ref
+
+        # Create predictions for each file (max 5 files)
+        predictions: list[LocationPrediction] = []
+        for uri, ref in list(file_refs.items())[:5]:
+            predictions.append(LocationPrediction(
+                line=ref.line,
+                column=ref.column,
+                rule=RuleType.RENAME,
+                confidence=0.75,  # Lower than same-file (0.9)
+                context={
+                    "old_name": detection.old_name,
+                    "new_name": detection.new_name,
+                    "remaining_refs": file_ref_counts[uri],
+                    "cross_file": True,
+                },
+                text=ref.context,
+                target_uri=uri,
+            ))
+
+        return predictions
+
+    def _try_cross_file_signature(
+        self, edit: EditRecord,
+    ) -> list[LocationPrediction]:
+        """Find cross-file call sites for a function whose signature changed.
+
+        Filters results to only files that import the source module.
+        """
+        detection = detect_signature_change(edit)
+        if detection is None:
+            return []
+
+        assert self._project_index is not None
+
+        refs = self._project_index.query_references(
+            name=detection.function_name,
+            exclude_uri=edit.uri,
+        )
+
+        if not refs:
+            return []
+
+        # Filter by import relationship
+        source_module = self._module_name_from_uri(edit.uri)
+        if source_module:
+            refs = [
+                ref for ref in refs
+                if self._file_imports_module(ref.uri, source_module)
+            ]
+
+        if not refs:
+            return []
+
+        # Group by file
+        file_refs: dict[str, Any] = {}
+        file_ref_counts: dict[str, int] = {}
+        for ref in refs:
+            file_ref_counts[ref.uri] = file_ref_counts.get(ref.uri, 0) + 1
+            if ref.uri not in file_refs:
+                file_refs[ref.uri] = ref
+
+        predictions: list[LocationPrediction] = []
+        for uri, ref in list(file_refs.items())[:5]:
+            predictions.append(LocationPrediction(
+                line=ref.line,
+                column=ref.column,
+                rule=RuleType.SIGNATURE,
+                confidence=0.65,  # Lower than same-file (0.8)
+                context={
+                    "function_name": detection.function_name,
+                    "remaining_sites": file_ref_counts[uri],
+                    "cross_file": True,
+                },
+                text=ref.context,
+                target_uri=uri,
+            ))
+
+        return predictions
+
+    # -----------------------------------------------------------------------
+    # Import relation helpers
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _module_name_from_uri(uri: str) -> str | None:
+        """Extract module base name from a file URI.
+
+        file:///path/to/api.py → "api"
+        file:///path/to/utils.js → "utils"
+        """
+        import os
+        path = uri[7:] if uri.startswith("file://") else uri
+        basename = os.path.basename(path)
+        name, _ = os.path.splitext(basename)
+        return name if name else None
+
+    def _file_imports_module(self, file_uri: str, module_name: str) -> bool:
+        """Check if a file imports a given module (by base name match)."""
+        assert self._project_index is not None
+        imports = self._project_index.get_file_imports(file_uri)
+        return module_name in imports

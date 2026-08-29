@@ -33,6 +33,7 @@ from .protocol import (
 )
 from .document_store import DocumentStore
 from .pipeline import Pipeline
+from .project_index import ProjectIndex, find_git_root, uri_to_path
 
 logger = logging.getLogger("next-edit-server")
 
@@ -40,13 +41,14 @@ logger = logging.getLogger("next-edit-server")
 class NextEditServer:
     """The core server that processes JSON-RPC messages and coordinates modules."""
 
-    def __init__(self, model_path: str | None = None) -> None:
+    def __init__(self, model_path: str | None = None, workspace_root: str | None = None) -> None:
         self.document_store = DocumentStore()
         self._writer_lock = threading.Lock()
         self._stdin: BufferedReader | None = None
         self._stdout: BufferedWriter | None = None
         self._running = False
         self._model_path = model_path
+        self._workspace_root = workspace_root  # CLI fallback; may be overridden by initialize
 
         # Pipeline (initialized after stdio is ready)
         self._pipeline: Pipeline | None = None
@@ -157,7 +159,23 @@ class NextEditServer:
 
         LanguageClient blocks until it receives this response. We advertise
         textDocumentSync so the client sends didOpen/didChange/didSave/didClose.
+        Also extracts workspace root for cross-file indexing.
         """
+        params = msg.params or {}
+
+        # Extract workspace root from LSP initialize params
+        root_uri = params.get("rootUri") or ""
+        if not root_uri:
+            workspace_folders = params.get("workspaceFolders") or []
+            if workspace_folders:
+                root_uri = workspace_folders[0].get("uri", "")
+
+        if root_uri:
+            self._workspace_root = uri_to_path(root_uri)
+            logger.info("Workspace root from initialize: %s", self._workspace_root)
+        elif not self._workspace_root:
+            logger.info("No workspace root from initialize or CLI, will infer from first didOpen")
+
         result = {
             "capabilities": {
                 "textDocumentSync": {
@@ -178,6 +196,10 @@ class NextEditServer:
         # This sends loading_model → ready status notifications to the client.
         if self._pipeline:
             self._pipeline.initialize()
+
+            # Start cross-file index if workspace root is known
+            if self._workspace_root:
+                self._pipeline.start_project_index(self._workspace_root)
 
     def _handle_shutdown(self, msg: JsonRpcMessage) -> None:
         """Respond to LSP shutdown request."""
@@ -238,6 +260,15 @@ class NextEditServer:
         p = _parse_did_open(params)
         self.document_store.open(p.uri, p.language_id, p.version, p.text)
         logger.info("Opened %s (v%d, %s)", p.uri, p.version, p.language_id)
+
+        # Last-resort workspace root inference from the first opened file
+        if not self._workspace_root and self._pipeline:
+            file_path = uri_to_path(p.uri)
+            inferred_root = find_git_root(file_path)
+            if inferred_root:
+                self._workspace_root = inferred_root
+                logger.info("Inferred workspace root from didOpen: %s", inferred_root)
+                self._pipeline.start_project_index(inferred_root)
 
     def _handle_did_change(self, params: dict[str, Any]) -> None:
         p = _parse_did_change(params)
@@ -309,6 +340,10 @@ class NextEditServer:
         uri = params.get("uri", "")
         version = params.get("version", 0)
         logger.debug("Saved %s (v%d)", uri, version)
+
+        # Trigger re-indexing for cross-file prediction
+        if self._pipeline:
+            self._pipeline.on_file_saved(uri)
 
     def _handle_did_close(self, params: dict[str, Any]) -> None:
         uri = params.get("uri", "")

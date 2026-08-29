@@ -51,6 +51,11 @@
           "enum": ["DEBUG", "INFO", "WARNING", "ERROR"],
           "default": "INFO",
           "description": "Server log level"
+        },
+        "nextone.crossFile.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable cross-file edit suggestions"
         }
       }
     }

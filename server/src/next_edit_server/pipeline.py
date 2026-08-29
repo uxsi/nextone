@@ -18,6 +18,8 @@ from .edit_history import EditHistory, EditRecord, build_edit_record
 from .location.engine import LocationEngine, LocationPrediction
 from .generation.generator import Generator, GenerationResult
 from .inference.backend import InferenceBackend, create_backend
+from .file_reader import FileReader
+from .project_index import ProjectIndex
 from .protocol import (
     Methods,
     SuggestParams,
@@ -89,6 +91,10 @@ class Pipeline:
         self._generator = Generator(self._backend)
         self._metrics = MetricsCollector()
 
+        # Cross-file support
+        self._project_index: ProjectIndex | None = None
+        self._file_reader = FileReader()
+
         # Debounce state
         self._debounce_ms = debounce_ms
         self._debounce_timer: threading.Timer | None = None
@@ -113,6 +119,39 @@ class Pipeline:
             Methods.STATUS,
             StatusParams(state=ServerState.READY, message="Ready"),
         )
+
+    def start_project_index(self, workspace_root: str) -> None:
+        """Start the background project index for cross-file prediction.
+
+        Called once the workspace root is known (from initialize params,
+        CLI arg, or inferred from the first didOpen URI).
+        """
+        if self._project_index is not None:
+            logger.info("Project index already started, skipping")
+            return
+
+        self._project_index = ProjectIndex(
+            workspace_root=workspace_root,
+            on_ready=self._on_index_ready,
+        )
+        self._project_index.start()
+        # Pass the index to the location engine
+        self._location_engine.set_project_index(self._project_index)
+        logger.info("Project index started for: %s", workspace_root)
+
+    def _on_index_ready(self) -> None:
+        """Callback from indexer when initial scan completes."""
+        if self._project_index:
+            logger.info(
+                "Project index ready: %d files, %d symbols",
+                self._project_index.file_count,
+                self._project_index.symbol_count,
+            )
+
+    def on_file_saved(self, uri: str) -> None:
+        """Called when a document is saved. Triggers re-indexing."""
+        if self._project_index:
+            self._project_index.on_file_saved(uri)
 
     def on_did_change(self, uri: str, version: int, old_lines: list[str], new_lines: list[str], start_line: int, end_line: int, timestamp: int) -> None:
         """Called when a document changes. Triggers debounced pipeline."""
@@ -194,7 +233,7 @@ class Pipeline:
             doc.language_id, latest_edit.old_lines, latest_edit.new_lines, latest_edit.start_line,
         )
 
-        # Run Location Module
+        # Run Location Module (same-file first)
         self._send(
             Methods.STATUS,
             StatusParams(state=ServerState.INFERRING, message="Analyzing..."),
@@ -207,15 +246,41 @@ class Pipeline:
             edit_history=self._edit_history.get(uri),
         )
 
-        if prediction is None:
-            logger.info("Pipeline: no location prediction, skipping generation")
-            self._send(
-                Methods.STATUS,
-                StatusParams(state=ServerState.READY),
-            )
+        if prediction is not None:
+            # Same-file suggestion
+            self._emit_same_file_suggestion(prediction, uri, version, doc.text, start_time)
             return
 
-        # Check version again before generation (might have gone stale during location)
+        # No same-file prediction — try cross-file
+        cross_predictions = self._location_engine.predict_cross_file(
+            edit=latest_edit,
+            source_code=doc.text,
+            language=doc.language_id,
+            edit_history=self._edit_history.get(uri),
+        )
+
+        if cross_predictions:
+            best = cross_predictions[0]
+            self._emit_cross_file_suggestion(best, uri, version, start_time)
+            return
+
+        # Nothing to suggest
+        logger.info("Pipeline: no prediction (same-file or cross-file)")
+        self._send(
+            Methods.STATUS,
+            StatusParams(state=ServerState.READY),
+        )
+
+    def _emit_same_file_suggestion(
+        self,
+        prediction: LocationPrediction,
+        uri: str,
+        version: int,
+        source_code: str,
+        start_time: float,
+    ) -> None:
+        """Generate and send a same-file suggestion (existing Phase 1 logic)."""
+        # Check version again before generation
         if self._doc_store.is_version_stale(uri, version):
             self._metrics.record("stale")
             self._send(Methods.STATUS, StatusParams(state=ServerState.READY))
@@ -229,7 +294,7 @@ class Pipeline:
 
         result = self._generator.generate(
             prediction=prediction,
-            source_code=doc.text,
+            source_code=source_code,
             uri=uri,
             version=version,
             edit_history=history_diffs,
@@ -271,6 +336,84 @@ class Pipeline:
 
         self._current_suggestion_id = result.suggestion_id
         self._current_suggestion_version = version
+        self._metrics.record("trigger", result.suggestion_id, elapsed_ms)
+
+        self._send(Methods.STATUS, StatusParams(state=ServerState.READY))
+
+    def _emit_cross_file_suggestion(
+        self,
+        prediction: LocationPrediction,
+        source_uri: str,
+        source_version: int,
+        start_time: float,
+    ) -> None:
+        """Generate and send a cross-file suggestion."""
+        target_uri = prediction.target_uri
+        assert target_uri is not None
+
+        # Read target file content: prefer DocumentStore (open in editor), fallback to disk
+        target_doc = self._doc_store.get(target_uri)
+        if target_doc:
+            target_source = target_doc.text
+            target_version = target_doc.version
+        else:
+            target_source = self._file_reader.read(target_uri)
+            if target_source is None:
+                logger.info("Cross-file target not readable: %s", target_uri)
+                self._send(Methods.STATUS, StatusParams(state=ServerState.READY))
+                return
+            target_version = -1  # Not tracked by editor
+
+        # Check source version hasn't gone stale during file read
+        if self._doc_store.is_version_stale(source_uri, source_version):
+            self._metrics.record("stale")
+            self._send(Methods.STATUS, StatusParams(state=ServerState.READY))
+            return
+
+        # Run Generation Module on the target file
+        history_diffs = [
+            {"file": e.uri, "diff": e.nes_diff}
+            for e in self._edit_history.get(source_uri)
+        ]
+
+        result = self._generator.generate(
+            prediction=prediction,
+            source_code=target_source,
+            uri=target_uri,
+            version=source_version,  # baseVersion references the source file
+            edit_history=history_diffs,
+        )
+
+        if result is None:
+            self._send(Methods.STATUS, StatusParams(state=ServerState.READY))
+            return
+
+        # Send suggestion — note uri (target) != base_uri (source)
+        elapsed_ms = int((time.monotonic() - start_time) * 1000)
+
+        self._send(
+            Methods.SUGGEST,
+            SuggestParams(
+                id=result.suggestion_id,
+                uri=target_uri,
+                base_uri=source_uri,
+                base_version=source_version,
+                location=Position(line=result.location_line, character=0),
+                diff=result.diff_text,
+                description=result.description,
+                deleted_lines=[
+                    LineDiff(num=d["num"], text=d["text"])
+                    for d in result.deleted_lines
+                ],
+                added_lines=[
+                    LineDiff(num=a["num"], text=a["text"])
+                    for a in result.added_lines
+                ],
+            ),
+        )
+
+        self._current_suggestion_id = result.suggestion_id
+        self._current_suggestion_version = source_version
         self._metrics.record("trigger", result.suggestion_id, elapsed_ms)
 
         self._send(Methods.STATUS, StatusParams(state=ServerState.READY))
