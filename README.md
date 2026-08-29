@@ -10,7 +10,8 @@ nextone/
 │   ├── pyproject.toml
 │   ├── scripts/
 │   │   ├── verify_server.py            # 端到端验证脚本（同文件 + 跨文件）
-│   │   └── verify_lsp_path.py          # LSP 路径验证脚本
+│   │   ├── verify_lsp_path.py          # LSP 路径验证脚本
+│   │   └── verify_import_filter.py     # 跨文件 import 关系过滤验证
 │   ├── src/
 │   │   └── next_edit_server/
 │   │       ├── __main__.py             # CLI 入口
@@ -440,7 +441,7 @@ python -m pytest tests/ -v
 |---------|---------|--------|
 | `test_protocol.py` | 消息类型序列化、camelCase 转换、notification 构建 | 5 |
 | `test_document_store.py` | 文档打开/关闭、增量编辑、全量同步、版本检查 | 7 |
-| `test_location.py` | rename 检测与引用查找、signature 检测与调用点查找、pattern 检测、引擎集成 | 11 |
+| `test_location.py` | rename 检测与引用查找、signature 检测与调用点查找、pattern 检测、引擎集成、历史窗口 composite rename | 15 |
 | `test_generation.py` | prompt 构建、NES diff 解析、DummyBackend 集成 | 7 |
 | `test_pipeline.py` | 端到端 rename 流程、无匹配不触发、指标采集 | 5 |
 | `test_file_scanner.py` | git root 发现、gitignore 过滤、extension 匹配、大文件跳过 | 7 |
@@ -466,7 +467,7 @@ Phase 2，支持的能力：
 | 符号重命名传播 | 已实现（同文件 + 跨文件，tree-sitter / regex） |
 | 函数签名变更传播 | 已实现（同文件 + 跨文件） |
 | 重复模式检测 | 已实现（同文件，self./this. 属性） |
-| 跨文件项目索引 | 已实现（后台线程，git ls-files + tree-sitter） |
+| 跨文件项目索引 | 已实现（后台线程，git ls-files + tree-sitter，引用按 import 关系过滤） |
 | NES diff 生成 | 已实现（DummyBackend + llama.cpp 后端） |
 | 协议版本化 + 失效机制 | 已实现 |
 | 指标采集 | 已实现（JSON Lines 日志） |
@@ -495,6 +496,10 @@ Phase 2，支持的能力：
 | [008](./issues/008-new-lines-extraction-wrong.md) | _handle_did_change 中 new_lines 提取错误 | 高 |
 | [009](./issues/009-charwise-input-rename-detection.md) | 逐字输入新名称时无法检测 rename | 高 |
 | [010](./issues/010-parse-nes-diff-strips-indentation.md) | parse_nes_diff 中 strip() 去掉了代码缩进 | 中 |
+| [011](./issues/011-decoration-lost-on-tab-switch.md) | 切换标签页后 suggestion 高亮丢失 | 中 |
+| [012](./issues/012-multi-change-history-corruption.md) | 多 contentChanges 事件导致 edit history 失真 | 高 |
+| [013](./issues/013-composite-rename-missing-consistency-check.md) | composite rename 检测缺少中间编辑一致性校验 | 低 |
+| [014](./issues/014-loglevel-config-ignored.md) | logLevel 配置项不生效 | 低 |
 
 ## 技术参考
 
